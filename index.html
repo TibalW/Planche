@@ -1085,8 +1085,8 @@ function drawEl(ctx, e, o) {
         ctx.drawImage(hq.bmp, Math.round((hq.x - o.offX) * o.k), Math.round(hq.y * o.k));
       } else {
         const src = e.type === 'image' ? (m._before && !o.export ? m.prev0 : m.prev) : (o.vmap ? o.vmap.get(e.id) : vids.get(e.id));
-        if (src && (e.type === 'image' || src.readyState >= 2)) {
-          const r = srcRect(e, m.w, m.h), sw = e.type === 'image' ? src.width : src.videoWidth, f = sw / m.w;
+        if (src && (e.type === 'image' || src.readyState === undefined || src.readyState >= 2)) {
+          const r = srcRect(e, m.w, m.h), sw = e.type === 'image' ? src.width : (src.videoWidth || src.width), f = sw / m.w;
           ctx.drawImage(src, r.sx * f, r.sy * f, r.sw * f, r.sh * f, r.dx, r.dy, r.dw, r.dh);
         } else if (e.type === 'video' && m.poster && !o.export) {
           const r = srcRect(e, m.w, m.h), f = m.poster.width / m.w;
@@ -2566,20 +2566,63 @@ function loadExportVideo(url) {
     v.src = url;
   });
 }
-async function pickAvc(w, h, fps) {
+async function pickAvc(w, h, fps, mbps) {
   if (!('VideoEncoder' in window)) return null;
-  for (const codec of ['avc1.640033', 'avc1.64002A', 'avc1.4D0033', 'avc1.42E033', 'avc1.42001f']) {
-    const cfg = { codec, width: w, height: h, bitrate: EX.mbps * 1e6, framerate: fps, avc: { format: 'avc' }, bitrateMode: 'variable', latencyMode: 'quality' };
-    try { const r = await VideoEncoder.isConfigSupported(cfg); if (r.supported) return r.config || cfg; } catch (e) {}
+  const rates = [...new Set([mbps || EX.mbps, 60, 50, 40].filter(r => r <= (mbps || EX.mbps)))];
+  for (const rate of rates) for (const codec of ['avc1.640033', 'avc1.64002A', 'avc1.4D0033', 'avc1.42E033', 'avc1.42001f']) {
+    const cfg = { codec, width: w, height: h, bitrate: rate * 1e6, framerate: fps, avc: { format: 'avc' }, bitrateMode: 'variable', latencyMode: 'quality' };
+    try { const r = await VideoEncoder.isConfigSupported(cfg); if (r.supported) return Object.assign({}, r.config || cfg, { _mbps: rate }); } catch (e) {}
   }
   return null;
+}
+/* débit le plus haut possible en gardant un fichier qu'Instagram accepte (≈ 400 Mo au plus) */
+function videoRate(dur) { return Math.max(40, Math.min(80, Math.floor(3200 / Math.max(1, dur)))); }
+/* RVB (canvas sRGB) -> YUV 4:2:0 BT.709 en plage vidéo : conversion faite ici, à l'identique de l'étiquette du fichier */
+const YUV709 = (() => {
+  const Kr = 0.2126, Kb = 0.0722, Kg = 1 - Kr - Kb, s = 65536, ys = 219 / 255, cs = 224 / 255;
+  const q = v => Math.round(v * s);
+  return { yr: q(ys * Kr), yg: q(ys * Kg), yb: q(ys * Kb),
+    ur: q(-cs * Kr / (2 * (1 - Kb))), ug: q(-cs * Kg / (2 * (1 - Kb))), ub: q(cs * 0.5),
+    vr: q(cs * 0.5), vg: q(-cs * Kg / (2 * (1 - Kr))), vb: q(-cs * Kb / (2 * (1 - Kr))) };
+})();
+function rgbaToI420(d, W, H, out) {
+  const C = YUV709, cw = W >> 1, ch = H >> 1, uo = W * H, vo = uo + cw * ch;
+  for (let y = 0; y < H; y++) {
+    let p = y * W * 4, q = y * W;
+    for (let x = 0; x < W; x++, p += 4) out[q + x] = 16 + ((C.yr * d[p] + C.yg * d[p + 1] + C.yb * d[p + 2] + 32768) >> 16);
+  }
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const p0 = (2 * y * W + 2 * x) * 4, p1 = p0 + W * 4;
+      const r = d[p0] + d[p0 + 4] + d[p1] + d[p1 + 4], g = d[p0 + 1] + d[p0 + 5] + d[p1 + 1] + d[p1 + 5], b = d[p0 + 2] + d[p0 + 6] + d[p1 + 2] + d[p1 + 6];
+      out[uo + y * cw + x] = 128 + ((C.ur * r + C.ug * g + C.ub * b + 131072) >> 18);
+      out[vo + y * cw + x] = 128 + ((C.vr * r + C.vg * g + C.vb * b + 131072) >> 18);
+    }
+  }
+  return out;
+}
+/* réduction sans crénelage : divisions successives par 2 (comme des mipmaps) avant le dessin final */
+function mipChain(e, k) {
+  const m = media.get(e.mid), r = srcRect(e, m.w, m.h), need = (r.dw * k) / r.sw;
+  return { m, target: m.w * need, cv: [] };
+}
+function mipFrame(mc, v) {
+  let w = v.videoWidth, h = v.videoHeight, src = v, i = 0;
+  if (!w || !h) return v;
+  while (w > mc.target * 2 && i < 5) {
+    w = Math.max(1, Math.round(w / 2)); h = Math.max(1, Math.round(h / 2));
+    let c = mc.cv[i]; if (!c || c.width !== w || c.height !== h) { c = mc.cv[i] = newCanvas(w, h); c._g = c.getContext('2d'); c._g.imageSmoothingEnabled = true; c._g.imageSmoothingQuality = 'high'; }
+    c._g.drawImage(src, 0, 0, w, h); src = c; i++;
+  }
+  return src;
 }
 function toU8(buf) { return ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)) : new Uint8Array(buf.slice(0)); }
 async function exportVideoSlideBrowser(i, k, hq, onP) {
   const vels = S.els.filter(e => e.type === 'video' && onSlideOf(i)(e) && media.get(e.mid) && !media.get(e.mid).missing);
   const PW = Math.round(S.W * k), PH = Math.round(S.H * k);
   const fps = Math.min(60, media.get(vels[0].mid).fps || 30);
-  const cfg = await pickAvc(PW, PH, fps);
+  const dur0 = Math.max(0.5, Math.min(IG_MAX, Math.max(...vels.map(vlen))));
+  const cfg = await pickAvc(PW, PH, fps, videoRate(dur0));
   if (!cfg) { exMsg('Slide ' + (i + 1) + ' : ce navigateur ne sait pas encoder en H.264. Utilise Chrome ou Edge à jour, ou le mode Qualité maximale.', 'err'); return null; }
   const vmap = new Map();
   for (const e of vels) {
@@ -2589,10 +2632,13 @@ async function exportVideoSlideBrowser(i, k, hq, onP) {
   const dur = Math.max(0.5, Math.min(IG_MAX, Math.max(...vels.map(vlen))));
   const nF = Math.max(1, Math.round(dur * fps));
   let res = null, lastErr = null;
-  for (const c of [cfg, Object.assign({}, cfg, { hardwareAcceleration: 'prefer-software' })]) {
-    try { res = await encodeFrames(c, i, k, hq, vels, vmap, PW, PH, nF, fps, onP); break; }
-    catch (err) { lastErr = err; console.warn('encodeur', c.hardwareAcceleration || 'auto', err); if (exAbort) break; }
+  const enc0 = Object.assign({}, cfg); delete enc0._mbps;
+  const tries = [[enc0, true], [enc0, false], [Object.assign({}, enc0, { hardwareAcceleration: 'prefer-software' }), false]];
+  for (const [c, yuv] of tries) {
+    try { res = await encodeFrames(c, i, k, hq, vels, vmap, PW, PH, nF, fps, onP, yuv); break; }
+    catch (err) { lastErr = err; console.warn('encodeur', c.hardwareAcceleration || 'auto', yuv ? 'yuv' : 'rvb', err); if (exAbort) break; }
   }
+  if (res) exMsg('Slide ' + (i + 1) + ' : H.264 ' + PW + '×' + PH + ', ' + String(fps).replace('.', ',') + ' i/s, ' + cfg._mbps + ' Mb/s' + (res.yuv ? ', couleurs BT.709' : '') + '.', 'note');
   for (const v of vmap.values()) { v.removeAttribute('src'); v.load(); }
   if (exAbort) return null;
   if (!res) throw lastErr || new Error('encodage vidéo impossible');
@@ -2601,8 +2647,11 @@ async function exportVideoSlideBrowser(i, k, hq, onP) {
   onP(1);
   return muxMP4({ w: PW, h: PH, fps, video: res, audio });
 }
-async function encodeFrames(cfg, i, k, hq, vels, vmap, PW, PH, nF, fps, onP) {
-  const cv = newCanvas(PW, PH), ctx = cv.getContext('2d'); ctx.imageSmoothingQuality = 'high';
+async function encodeFrames(cfg, i, k, hq, vels, vmap, PW, PH, nF, fps, onP, yuv) {
+  const cv = newCanvas(PW, PH), ctx = cv.getContext('2d', yuv ? { willReadFrequently: true } : undefined); ctx.imageSmoothingQuality = 'high';
+  const mips = new Map(vels.map(e => [e.id, mipChain(e, k)])), smap = new Map();
+  const ybuf = yuv ? new Uint8Array(PW * PH * 3 / 2) : null;
+  const CS = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
   const samples = []; let desc = null, encErr = null;
   const enc = new VideoEncoder({
     output: (chunk, meta) => {
@@ -2617,9 +2666,13 @@ async function encodeFrames(cfg, i, k, hq, vels, vmap, PW, PH, nF, fps, onP) {
     if (exAbort || encErr || enc.state === 'closed') break;
     const t = f / fps;
     await Promise.all(vels.map(e => seekTo(vmap.get(e.id), (e.in || 0) + Math.min(t * (e.speed || 1), e.out - e.in - 0.5 / fps) + 0.0005)));
+    for (const e of vels) smap.set(e.id, mipFrame(mips.get(e.id), vmap.get(e.id)));
     ctx.setTransform(k, 0, 0, k, -i * S.W * k, 0);
-    drawBoard(ctx, Object.assign({}, base, { vmap, t }));
-    const vf = new VideoFrame(cv, { timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps) });
+    drawBoard(ctx, Object.assign({}, base, { vmap: smap, t }));
+    const ts = Math.round(f * 1e6 / fps), du = Math.round(1e6 / fps);
+    let vf;
+    if (yuv) { ctx.setTransform(1, 0, 0, 1, 0, 0); rgbaToI420(ctx.getImageData(0, 0, PW, PH).data, PW, PH, ybuf); vf = new VideoFrame(ybuf, { format: 'I420', codedWidth: PW, codedHeight: PH, timestamp: ts, duration: du, colorSpace: CS }); }
+    else vf = new VideoFrame(cv, { timestamp: ts, duration: du });
     enc.encode(vf, { keyFrame: f % gop === 0 }); vf.close();
     while (enc.encodeQueueSize > 6) await sleep(4);
     if (f % 5 === 0) onP(f / nF * 0.9);
@@ -2629,7 +2682,7 @@ async function encodeFrames(cfg, i, k, hq, vels, vmap, PW, PH, nF, fps, onP) {
   if (encErr) throw encErr;
   if (exAbort) return null;
   if (!desc) throw new Error('l’encodeur n’a pas fourni de configuration H.264');
-  return { desc, samples };
+  return { desc, samples, yuv: !!yuv };
 }
 const audioCache = new Map();
 async function buildAudio(els, dur, i) {
@@ -4038,7 +4091,7 @@ if (TOUCH) {
   const wn = document.querySelector('[data-panel="2"] .wz-tools .note'); if (wn) wn.textContent = 'Appui long sur une vignette, puis glisse-la pour la déplacer. Touche-la pour la retirer ou la remettre.';
   $('#hint').textContent = 'Touche une photo pour la choisir · double-tap : recadrer · deux doigts : zoomer · appui long sur une vignette : la glisser sur une slide';
   const vb = document.querySelector('input[name=vmode][value=browser]');
-  if (vb) { const l = vb.closest('label'); l.querySelector('span').textContent = 'Sur la tablette'; l.querySelector('small').textContent = 'Encodé ici, image par image, depuis tes vidéos (H.264, 1080 px). Les fondus, la coupe et la vitesse sont gardés.'; }
+  if (vb) { const l = vb.closest('label'); l.querySelector('span').textContent = 'Sur la tablette'; l.querySelector('small').textContent = 'Qualité maximale de la tablette : chaque image recalculée depuis tes vidéos, réduction sans crénelage, couleurs BT.709 exactes, cadence d’origine, H.264 jusqu’à 80 Mb/s.'; }
   if (EX.vmode === 'ffmpeg') EX.vmode = 'browser';
 }
 
