@@ -1,5 +1,5 @@
 /* Planche – service worker : fonctionne hors ligne et reçoit les photos partagées depuis la Galerie */
-const V = 'planche-7284f7cfee';
+const V = 'planche-a8c4245b0c';
 const SHELL = ['./', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
